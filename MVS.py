@@ -6,20 +6,35 @@ DEVICE_NAME = "BT24"
 NOTIFY_UUID  = "0000ffe1-0000-1000-8000-00805f9b34fb"
 
 
-def callback_when_notify(sender, data):
-    """每收到一包 BLE 数据就调用一次"""
-    text = data.decode(errors="ignore").strip()                       # 解码data（将从蓝牙中得到的数据转换为字符串），忽略错误，并去掉开头和结尾的\r\n
-    if not text: return
+'''
+uint8_t sendMsg[9]:
+帧头         长度    角度     距离        校验      帧尾
+0xAA 0x55    N      int16    uint16      XOR      0x0D
+0    1       2      3   4    5    6      7        8
 
-    # 解析 "d=123,a=45"
+角度单位: 0.01度
+距离单位: mm
+'''
+
+"""每收到一包 BLE 数据就调用一次"""
+def callback_when_notify(sender, data):
+    # 校验数据
+    print("收到数据")
+    if not ( data[0] == 0xAA and data[1] == 0x55 and data[8] == 0x0D ): return # 检查帧头和帧尾
+    checksum = data[2] ^ data[3] ^ data[4] ^ data[5] ^ data[6]                 # 检查校验和
+    if checksum != data[7]: return
+    
+    # 解析数据
     try:
-        parts = text.split(",")
-        d = float(parts[0].split("=")[1])
-        a = float(parts[1].split("=")[1])
-        msg = f"a={a:.1f}°\nd={d:.1f}cm\n"
-        print(msg)
+        angle_row = (data[3] << 8) + data[4]
+        distance_row = (data[5] << 8) + data[6]
+        # 转换单位
+        angle = float(angle_row) / 100.0
+        distance = float(distance_row) / 1000.0
     except Exception:
         pass
+
+    print(f"a={angle:.2f}°, d={distance:.3f}m")
 
 
 async def main():
@@ -38,6 +53,7 @@ async def main():
         return
 
     # 2. 连接 + 订阅
+    print(target)
     async with BleakClient(target) as client:
         print(f"已连接 {target.address}")
         await client.start_notify(NOTIFY_UUID, callback_when_notify)    # 订阅特征 NOTIFY_UUID ，并为这个特征的通知添加回调函数 callback_when_notify
