@@ -1,10 +1,57 @@
 import asyncio
 from bleak import BleakClient, BleakScanner
+import numpy as np
+from scipy.ndimage import median_filter
 
 
 DEVICE_NAME = "BT24"
 NOTIFY_UUID  = "0000ffe1-0000-1000-8000-00805f9b34fb"
 
+
+class FullRadarFilter:
+    def __init__(self, n_angles=180, spatial_window=5,
+                 alpha_slow=0.2, alpha_fast=0.9, threshold=300):
+        self.n = n_angles
+        self.spatial_window = spatial_window
+        self.alpha_slow = alpha_slow
+        self.alpha_fast = alpha_fast
+        self.threshold = threshold
+        self.current = np.full(n_angles, np.nan)
+        self.last = np.full(n_angles, np.nan)
+    
+    def feed(self, angle_deg, dist_mm):
+        idx = int(round(angle_deg))
+        if 0 <= idx < self.n:
+            self.current[idx] = dist_mm
+        if idx == 0 and not np.all(np.isnan(self.last)):
+            return self.finish_scan()
+        return None
+    
+    def finish_scan(self):
+        # 1. 空间维中值（跳过NaN）
+        valid = ~np.isnan(self.current)
+        if valid.sum() < self.spatial_window:
+            self.last = self.current.copy()
+            self.current[:] = np.nan
+            return self.last
+        
+        smoothed = self.current.copy()
+        smoothed[valid] = median_filter(self.current[valid],
+                                        size=self.spatial_window,
+                                        mode='nearest')
+        
+        # 2. 时间维自适应融合
+        fused = smoothed.copy()
+        both_valid = valid & ~np.isnan(self.last)
+        for i in np.where(both_valid)[0]:
+            diff = abs(smoothed[i] - self.last[i])
+            alpha = self.alpha_fast if diff > self.threshold else self.alpha_slow
+            fused[i] = alpha * smoothed[i] + (1 - alpha) * self.last[i]
+        
+        # 3. 更新
+        self.last = fused.copy()
+        self.current[:] = np.nan
+        return fused
 
 '''
 uint8_t sendMsg[9]:
