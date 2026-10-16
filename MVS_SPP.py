@@ -5,7 +5,103 @@ import time
 import threading
 import serial
 import struct
-import os
+import queue
+
+
+RESOLUTION = 0.45
+DEBUG = True
+
+
+'''
+后处理：
+0. 将所有传感器数据固定到分辨率0.45°的极坐标上
+1. 同一角度重复采样 -> 卡尔曼滤波
+2. 相邻两个测量角度 -> 插值（相邻两个测量角度的差值最小是0.9度，且一定是0.9°的倍数）
+'''
+class AnyFilter:
+    def __init__(self):
+        self.value  = 0
+        self.numbers_of_iteration = 1
+
+    def feed_all(self, new_values: queue.Queue, algorithm: str) -> float:
+        dists = []
+
+        while not new_values.empty():
+            v = new_values.get_nowait()
+            if v is None or v < 0: continue
+            dists.append(v)
+
+        if not dists:
+            return 0.0
+        elif len(dists) == 1:
+            return dists[0]
+
+        if algorithm.lower() == 'average':
+            return sum(dists) / len(dists)
+        
+        elif algorithm.lower() == 'mediam':
+            dists.sort()
+            return dists[len(dists) // 2]
+
+        else:
+            pass
+        
+
+
+class PostProcessor:
+    def __init__(self):
+        # self.this_dist = 0
+        self.this_angle = 0
+        # self.previous_dist = 0
+        self.previous_angle = 0
+
+        # 初始化坐标表格，分辨率：RESOLUTION°
+        self.coordinate_graph = [-1] * round(180 / RESOLUTION + 1)
+
+        # 滤波器
+        self.filter = AnyFilter()
+
+
+    def write(self, r, theta):
+        '''向self.coordinate_graph中写入一个点'''
+        index = round(theta / RESOLUTION)
+        if 0 <= index < len(self.coordinate_graph):
+            self.coordinate_graph[index] = r
+        
+
+    def clear_area(self, from_angle, to_angle):
+        from_index = round(from_angle / RESOLUTION)
+        to_index = round(to_angle / RESOLUTION)
+
+        left = min(from_index, to_index)
+        right = max(from_index, to_index)
+
+        # 开区间内所有数值改为-1
+        for index in range(left + 1, right):
+            if 0 <= index < len(self.coordinate_graph):
+                self.coordinate_graph[index] = -1
+
+
+    def feed_all(self, new_dists: queue.Queue, new_angle: float):
+        if new_dists.empty(): return
+
+        # 滤波
+        new_dist = self.filter.feed_all(new_dists, 'average')
+
+        # 更新self数据
+        self.previous_angle = self.this_angle
+        self.this_angle     = new_angle
+
+        # 更新坐标图
+        self.clear_area(self.previous_angle, self.this_angle)
+        self.write(new_dist, new_angle)
+        self.interpolation_auto()
+
+
+    def interpolation_auto(self):
+        '''将self.coordinate_graph里的-1拟合为其他数字'''
+        pass
+
 
 
 class FrameParser:
@@ -50,7 +146,8 @@ class FrameParser:
         return frames
 
 
-class SPPReceiver:
+
+class SppReceiver:
     """
     JDP-31-SPP 蓝牙串口接收 / 发送器
     - COM9, 9600, 8N1
@@ -165,6 +262,7 @@ class SPPReceiver:
                 time.sleep(1.0)
 
 
+
 """
 uint8_t sendMsg[9]:
 帧头         长度    角度      距离        校验      帧尾
@@ -174,7 +272,7 @@ uint8_t sendMsg[9]:
 角度单位: 0.01度
 距离单位: mm
 """
-def callback_when_notify(sender, data):
+def callback_when_notify(sender, data) -> list:
     """每收到一包数据就调用一次。data 必须是长度为 9 的 bytes。"""
     if len(data) < 9:
         return
@@ -201,65 +299,78 @@ def callback_when_notify(sender, data):
     except Exception:
         return
 
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print(f"a={angle:.2f}°, d={distance:.3f}m")
+    if DEBUG:
+        print(f"d={distance}, a={angle}")
+    return [distance, angle]
 
 
 def main():
-
     parser = FrameParser()
-    def on_spp_bytes(data: bytes):
-        # 从字节流里拆出完整帧，再交给已有的解析函数
+    post_processor = PostProcessor()
+    dist_resamples = queue.Queue()
+    angle_resamples = queue.Queue()
+    previous_angle = -1
+    
+    def callback_when_receive_data(data: bytes):
+        '''从字节流里拆出完整帧，再交给已有的解析函数'''
+        nonlocal previous_angle
+
         for frame in parser.feed(data):
-            callback_when_notify("SPP", frame)
+            decode = callback_when_notify("SPP", frame)
+            if decode is None: continue
+            [dist, angle] = decode
 
-    receiver = SPPReceiver(
-        port="COM9",
-        baudrate=9600,
-        on_bytes=on_spp_bytes,
-    )
-    receiver.start_in_subProcess()
+            # 如果角度变化，说明重复采样结束。开始后处理
+            if previous_angle == -1:
+                previous_angle = angle
+            elif angle != previous_angle:
+                previous_angle = angle
+                post_processor.feed_all(dist_resamples, angle)
 
-    print("等待雷达数据...")
+            dist_resamples.put(dist)
+                
+    client = SppReceiver(port="COM9",
+                         baudrate=9600,
+                         on_bytes=callback_when_receive_data)
+    client.start_in_subProcess()
+    print("上位机已启动")
 
     try:
         while True:
-            command = input("> ").strip()
-            if not command:
-                continue
+            command = input("> ").strip().split()
+            if not command: continue
 
-            # 例:
-            # cmd 0 0       单参数命令, 解除暂停
-            # cmd 0 1       单参数命令, 暂停
-            # cmd 1 1       单参数命令, 开 OLED
-            # cmd 2 1 5     双参数命令
-            parts = command.split()
-
-            if parts[0].lower() == "cmd":
+            if command[0].lower() == "cmd":
                 try:
-                    nums = [int(x, 0) for x in parts[1:]]
+                    nums = [int(x, 0) for x in command[1:]]
                 except ValueError:
-                    print("格式错误，例如: cmd 0 0")
+                    print("格式错误")
                     continue
 
                 if len(nums) == 2:
-                    ok = receiver.send_u16_command(nums[0], nums[1])
+                    SEND_SUCCESS = client.send_u16_command(nums[0], nums[1])
                 elif len(nums) == 3:
-                    ok = receiver.send_u16_command(nums[0], nums[1], nums[2])
+                    SEND_SUCCESS = client.send_u16_command(nums[0], nums[1], nums[2])
                 else:
-                    print("格式错误，例如: cmd 0 0 或 cmd 2 1 5")
                     continue
 
-                if ok:
-                    print(f"[PC -> 下位机] 已发送: {nums}")
+                if SEND_SUCCESS:
+                    print(f"[Windows -> STM32] 已发送: {nums}")
                 else:
-                    print("[PC -> 下位机] 发送失败，串口未连接")
+                    print("[Windows -> STM32] 发送失败")
+
+            elif command[0].lower() in ['q', 'quit']:
+                print("\n退出")
+                break
+
             else:
-                print("未知输入。可用格式: cmd <cmd_type> [param1] [param2]")
+                print("未知命令。可用格式: cmd <cmd_type> [param1] [param2]")
+                
     except KeyboardInterrupt:
         print("\n退出")
+
     finally:
-        receiver.stop()
+        client.stop()
 
 
 if __name__ == "__main__":
