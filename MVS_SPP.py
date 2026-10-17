@@ -9,57 +9,24 @@ import queue
 
 
 RESOLUTION = 0.45
+MAX_GAP = 5
 DEBUG = True
 
 
 '''
 后处理：
 0. 将所有传感器数据固定到分辨率0.45°的极坐标上
-1. 同一角度重复采样 -> 卡尔曼滤波
-2. 相邻两个测量角度 -> 插值（相邻两个测量角度的差值最小是0.9度，且一定是0.9°的倍数）
+1. 同一角度重复采样 -> 滤波
+2. 相邻两个测量角度 -> 插值
+注意：舵机的步进角度是0.45的偶数倍
 '''
-class AnyFilter:
-    def __init__(self):
-        self.value  = 0
-        self.numbers_of_iteration = 1
-
-    def feed_all(self, new_values: queue.Queue, algorithm: str) -> float:
-        dists = []
-
-        while not new_values.empty():
-            v = new_values.get_nowait()
-            if v is None or v < 0: continue
-            dists.append(v)
-
-        if not dists:
-            return 0.0
-        elif len(dists) == 1:
-            return dists[0]
-
-        if algorithm.lower() == 'average':
-            return sum(dists) / len(dists)
-        
-        elif algorithm.lower() == 'mediam':
-            dists.sort()
-            return dists[len(dists) // 2]
-
-        else:
-            pass
-        
-
-
 class PostProcessor:
     def __init__(self):
-        # self.this_dist = 0
         self.this_angle = 0
-        # self.previous_dist = 0
         self.previous_angle = 0
 
         # 初始化坐标表格，分辨率：RESOLUTION°
         self.coordinate_graph = [-1] * round(180 / RESOLUTION + 1)
-
-        # 滤波器
-        self.filter = AnyFilter()
 
 
     def write(self, r, theta):
@@ -86,7 +53,7 @@ class PostProcessor:
         if new_dists.empty(): return
 
         # 滤波
-        new_dist = self.filter.feed_all(new_dists, 'average')
+        new_dist = self.any_filter(new_dists, 'average')
 
         # 更新self数据
         self.previous_angle = self.this_angle
@@ -98,9 +65,51 @@ class PostProcessor:
         self.interpolation_auto()
 
 
+    @staticmethod
+    def any_filter(new_values: queue.Queue, algorithm: str) -> float:
+        values = []
+
+        while not new_values.empty():
+            temp = new_values.get_nowait()
+            if temp is None or temp < 0: continue
+            values.append(temp)
+
+        # 如果只有一个值，就不需要滤波
+        if not values:
+            return 0.0
+        elif len(values) == 1:
+            return values[0]
+
+        # 按要求选择滤波算法
+        if algorithm.lower() == 'average':
+            return sum(values) / len(values)
+        elif algorithm.lower() == 'mediam':
+            values.sort()
+            return values[len(values) // 2]
+        else:
+            pass
+
+
     def interpolation_auto(self):
-        '''将self.coordinate_graph里的-1拟合为其他数字'''
-        pass
+        '''将self.coordinate_graph里的-1拟合为其他数字，采用线性插值'''
+        # 有效值索引表格
+        valid_index_list = [index for index, value in enumerate(self.coordinate_graph) if value >= 0]
+        if len(valid_index_list) <= 1: return
+
+        for i in range(len(valid_index_list) - 1):
+            # 按左右有效值定义一个空洞
+            left_valid_index = valid_index_list[i]
+            right_valid_index = valid_index_list[i + 1]
+
+            # 只填补中间的小空洞；大空洞保持 -1，避免乱连
+            inserts = right_valid_index - left_valid_index - 1
+            if inserts <= 0 or inserts > MAX_GAP:
+                continue
+
+            # 在空洞里逐个插值
+            for index in range(left_valid_index + 1, right_valid_index):
+                duty = (index - left_valid_index) / (right_valid_index - left_valid_index)
+                self.coordinate_graph[index] = self.coordinate_graph[left_valid_index] * (1.0 - duty) + self.coordinate_graph[right_valid_index] * duty
 
 
 
